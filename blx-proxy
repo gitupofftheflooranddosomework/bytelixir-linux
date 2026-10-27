@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+#
+# blx-proxy — manage a Bytelixir proxy node on Linux.
+#
+# This tool only configures YOUR OWN proxy (3proxy) on a server you own.
+# It never touches your Bytelixir account: no dashboard login, no API calls,
+# no auto-registration. You paste the printed proxy string into the
+# Bytelixir dashboard yourself, after passing KYC (required before proxies
+# can be added).
+#
+# Usage:
+#   blx-proxy setup [--port N] [--with-socks] [--socks-port N]
+#                   [--user NAME] [--host IP] [--bandwidth-mbps N]
+#   blx-proxy status
+#   blx-proxy show
+#   blx-proxy rotate
+#   blx-proxy test
+#   blx-proxy uninstall
+#
+set -euo pipefail
+
+CONFIG_DIR="/etc/blx-proxy"
+CONFIG_FILE="$CONFIG_DIR/3proxy.cfg"
+CREDS_FILE="$CONFIG_DIR/credentials"
+LOG_DIR="/var/log/blx-proxy"
+SERVICE="blx-proxy"
+PROXY_BIN="${BLX_PROXY_BIN:-/usr/local/bin/3proxy}"
+
+die() { echo "blx-proxy: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
+need_bin() { [ -x "$PROXY_BIN" ] || die "3proxy not found at $PROXY_BIN — run install.sh first"; }
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \?//'
+  exit 0
+}
+
+# --- credential helpers -------------------------------------------------
+# Credentials live ONLY in $CREDS_FILE (0600, root-only). They are never
+# printed except by `show`/`rotate`/`setup` for the owner to paste into
+# their own Bytelixir dashboard.
+
+gen_password() { openssl rand -hex 16; }
+
+load_creds() {
+  [ -f "$CREDS_FILE" ] || die "no credentials found — run 'blx-proxy setup' first"
+  # shellcheck disable=SC1090
+  . "$CREDS_FILE"
+  [ -n "${BLX_USER:-}" ] && [ -n "${BLX_PASS:-}" ] || die "credentials file is incomplete"
+}
+
+# --- config rendering ---------------------------------------------------
+# Renders 3proxy.cfg from the template next to this script. Template ships
+# with placeholders only — no secrets are ever committed to the repo.
+
+render_config() {
+  local port="$1" socks_port="$2" user="$3" pass="$4" bw_bytes="$5"
+  local template
+  template="$(dirname "$0")/3proxy.cfg.template"
+  [ -f "$template" ] || template="$CONFIG_DIR/3proxy.cfg.template"
+  [ -f "$template" ] || die "config template not found"
+
+  mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+  local socks_block=""
+  if [ -n "$socks_port" ]; then
+    socks_block="socks -p$socks_port"
+  fi
+  # NOTE: GNU sed turns \n in the replacement into a real newline, but a
+  # literal newline inside a -e argument breaks the s command outright.
+  # So the two-line bandwidth block is built with an escaped \n.
+  local bw_block=""
+  if [ "$bw_bytes" -gt 0 ]; then
+    bw_block="bandlimin $bw_bytes $user\\nbandlimout $bw_bytes $user"
+  fi
+  sed -e "s|@PORT@|$port|g" \
+      -e "s|@USER@|$user|g" \
+      -e "s|@PASS@|$pass|g" \
+      -e "s|@LOGDIR@|$LOG_DIR|g" \
+      -e "s|@SOCKS_BLOCK@|$socks_block|g" \
+      -e "s|@BW_BLOCK@|$bw_block|g" \
+      "$template" > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  chmod 0600 "$CONFIG_FILE"
+}
+
+service_action() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl "$@" "$SERVICE" || true
+  fi
+}
+
+detect_host() {
+  local host=""
+  host="$(curl -fsS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
+  if [ -n "$host" ]; then
+    echo "$host"
+  else
+    echo "<YOUR-PUBLIC-IP>"
+  fi
+}
+
+print_string() {
+  local scheme="$1" user="$2" pass="$3" host="$4" port="$5"
+  echo "  $scheme://$user:$pass@$host:$port"
+}
+
+# --- commands -----------------------------------------------------------
+
+cmd_setup() {
+  need_root
+  need_bin
+  local port=3128 socks_port="" user="blx" host="" bw_mbps=50
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --with-socks) [ -n "$socks_port" ] || socks_port=1080; shift ;;
+      --socks-port) socks_port="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --bandwidth-mbps) bw_mbps="$2"; shift 2 ;;
+      -h|--help) usage ;;
+      *) die "unknown option: $1 (see 'blx-proxy setup --help')" ;;
+    esac
+  done
+  case "$port" in ''|*[!0-9]*) die "--port must be a number" ;; esac
+  if [ -n "$socks_port" ]; then
+    case "$socks_port" in ''|*[!0-9]*) die "--socks-port must be a number" ;; esac
+    [ "$socks_port" != "$port" ] || die "SOCKS port must differ from HTTP port"
+  fi
+  case "$user" in ''|*[!a-zA-Z0-9_-]*) die "--user may only contain letters, digits, _ and -" ;; esac
+  case "$bw_mbps" in ''|*[!0-9]*) die "--bandwidth-mbps must be a number (0 = unlimited)" ;; esac
+
+  local pass bw_bytes=0
+  pass="$(gen_password)"
+  if [ "$bw_mbps" -gt 0 ]; then
+    bw_bytes=$(( bw_mbps * 125000 ))
+  fi
+  [ -z "$host" ] && host="$(detect_host)"
+
+  render_config "$port" "$socks_port" "$user" "$pass" "$bw_bytes"
+  {
+    echo "BLX_USER=$user"
+    echo "BLX_PASS=$pass"
+    echo "BLX_PORT=$port"
+    echo "BLX_SOCKS_PORT=$socks_port"
+    echo "BLX_HOST=$host"
+    echo "BLX_BW_MBPS=$bw_mbps"
+  } > "$CREDS_FILE"
+  chmod 0600 "$CREDS_FILE"
+  cp "$(dirname "$0")/3proxy.cfg.template" "$CONFIG_DIR/3proxy.cfg.template" 2>/dev/null || true
+
+  service_action daemon-reload
+  service_action enable
+  service_action restart
+  sleep 1
+  echo "Proxy is up."
+  echo
+  echo "Paste this into your Bytelixir dashboard (Proxies -> Add proxies -> One by one):"
+  print_string "http" "$user" "$pass" "$host" "$port"
+  if [ -n "$socks_port" ]; then
+    echo "SOCKS5 entry (add as a second proxy if you want it):"
+    print_string "socks5" "$user" "$pass" "$host" "$socks_port"
+  fi
+  echo
+  echo "Reminder: your Bytelixir account must pass KYC before proxies can be"
+  echo "added. Bytelixir validates the proxy within a couple of minutes."
+  if [ "$host" = "<YOUR-PUBLIC-IP>" ]; then
+    echo "NOTE: public IP auto-detection failed — replace <YOUR-PUBLIC-IP> with"
+    echo "your server's real public IP before adding it to the dashboard."
+  fi
+}
+
+cmd_status() {
+  need_root
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$SERVICE" --no-pager || true
+  else
+    [ -f /var/run/blx-proxy.pid ] && echo "pidfile present" || echo "no pidfile (not running?)"
+  fi
+  echo "--- listening ports ---"
+  (ss -ltnp 2>/dev/null | grep -E "3proxy|:$BLX_PORT" || ss -ltnp 2>/dev/null | grep 3proxy) || echo "(ss found no 3proxy listener)"
+  echo "--- recent log ---"
+  tail -n 20 "$LOG_DIR/3proxy.log" 2>/dev/null || echo "(no log yet)"
+}
+
+cmd_show() {
+  need_root
+  load_creds
+  echo "Paste into your Bytelixir dashboard (Proxies -> Add proxies -> One by one):"
+  print_string "http" "$BLX_USER" "$BLX_PASS" "$BLX_HOST" "$BLX_PORT"
+  if [ -n "${BLX_SOCKS_PORT:-}" ]; then
+    echo "SOCKS5 entry:"
+    print_string "socks5" "$BLX_USER" "$BLX_PASS" "$BLX_HOST" "$BLX_SOCKS_PORT"
+  fi
+}
+
+cmd_rotate() {
+  need_root
+  need_bin
+  load_creds
+  local pass bw_bytes=0
+  pass="$(gen_password)"
+  if [ "${BLX_BW_MBPS:-50}" -gt 0 ]; then
+    bw_bytes=$(( BLX_BW_MBPS * 125000 ))
+  fi
+  render_config "$BLX_PORT" "${BLX_SOCKS_PORT:-}" "$BLX_USER" "$pass" "$bw_bytes"
+  sed -i "s|^BLX_PASS=.*|BLX_PASS=$pass|" "$CREDS_FILE"
+  chmod 0600 "$CREDS_FILE" "$CONFIG_FILE"
+  service_action restart
+  sleep 1
+  echo "Password rotated. Update the proxy in your Bytelixir dashboard:"
+  print_string "http" "$BLX_USER" "$pass" "$BLX_HOST" "$BLX_PORT"
+  if [ -n "${BLX_SOCKS_PORT:-}" ]; then
+    print_string "socks5" "$BLX_USER" "$pass" "$BLX_HOST" "$BLX_SOCKS_PORT"
+  fi
+}
+
+cmd_test() {
+  need_root
+  load_creds
+  local port="${BLX_PORT}"
+  echo "Test 1: request WITHOUT credentials must FAIL (no open relay)..."
+  local code_noauth code_auth
+  code_noauth="$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+    -x "http://127.0.0.1:$port" http://example.com/ || echo "000")"
+  echo "  no-auth HTTP code: $code_noauth"
+  echo "Test 2: request WITH credentials must SUCCEED..."
+  code_auth="$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+    -x "http://$BLX_USER:$BLX_PASS@127.0.0.1:$port" http://example.com/ || echo "000")"
+  echo "  auth HTTP code: $code_auth"
+  if [ "$code_noauth" = "200" ]; then
+    echo "FAIL: proxy answered without credentials — STOP IT NOW (blx-proxy uninstall)" >&2
+    exit 1
+  fi
+  if [ "$code_auth" != "200" ]; then
+    echo "FAIL: authenticated request did not succeed (code $code_auth) — check $LOG_DIR/3proxy.log" >&2
+    exit 1
+  fi
+  echo "PASS: proxy requires auth and serves authenticated requests."
+  if [ -n "${BLX_SOCKS_PORT:-}" ]; then
+    echo "Test 3: SOCKS5 without credentials must FAIL..."
+    local socks_noauth socks_auth
+    socks_noauth="$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+      --socks5 "127.0.0.1:${BLX_SOCKS_PORT}" http://example.com/ || echo "000")"
+    echo "  no-auth SOCKS code: $socks_noauth"
+    echo "Test 4: SOCKS5 with credentials must SUCCEED..."
+    socks_auth="$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+      --socks5 "127.0.0.1:${BLX_SOCKS_PORT}" -U "$BLX_USER:$BLX_PASS" \
+      http://example.com/ || echo "000")"
+    echo "  auth SOCKS code: $socks_auth"
+    if [ "$socks_noauth" = "200" ]; then
+      echo "FAIL: SOCKS proxy answered without credentials — STOP IT NOW (blx-proxy uninstall)" >&2
+      exit 1
+    fi
+    if [ "$socks_auth" != "200" ]; then
+      echo "FAIL: authenticated SOCKS request did not succeed (code $socks_auth)" >&2
+      exit 1
+    fi
+    echo "PASS: SOCKS proxy requires auth and serves authenticated requests."
+  fi
+}
+
+cmd_uninstall() {
+  need_root
+  service_action stop
+  service_action disable
+  rm -f "/etc/systemd/system/$SERVICE.service"
+  service_action daemon-reload
+  rm -rf "$CONFIG_DIR"
+  echo "blx-proxy stopped and config removed."
+  echo "The 3proxy binary and blx-proxy script are left in place; delete them"
+  echo "manually if you want a full purge (/usr/local/bin/3proxy, /usr/local/bin/blx-proxy)."
+}
+
+# --- dispatch -----------------------------------------------------------
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  status) cmd_status ;;
+  show) cmd_show ;;
+  rotate) cmd_rotate ;;
+  test) cmd_test ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (try: setup, status, show, rotate, test, uninstall)" ;;
+esac

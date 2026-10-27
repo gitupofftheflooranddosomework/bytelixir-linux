@@ -1,0 +1,15 @@
+[Unit]
+Description=Bytelixir Linux proxy node (blx-proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/blx-proxy.pid
+ExecStart=/usr/local/bin/3proxy /etc/blx-proxy/3proxy.cfg
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

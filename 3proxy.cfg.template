@@ -1,0 +1,27 @@
+# 3proxy configuration for blx-proxy (Bytelixir Linux proxy node).
+#
+# PLACEHOLDERS ONLY — this template ships with no secrets. blx-proxy
+# renders a live copy with real values into /etc/blx-proxy/3proxy.cfg
+# (mode 0600, root-only). Never commit a rendered config.
+#
+# Security shape: auth strong + one user + explicit allow = no anonymous
+# access. Any request without the credentials is refused. That is what
+# keeps this from being an open relay.
+
+daemon
+pidfile /var/run/blx-proxy.pid
+nscache 65536
+
+auth strong
+users @USER@:CL:@PASS@
+allow @USER@
+
+@BW_BLOCK@
+
+# HTTP proxy (the entry Bytelixir's dashboard takes as scheme "http").
+proxy -p@PORT@
+
+# SOCKS5 proxy (only rendered when setup runs with --with-socks).
+@SOCKS_BLOCK@
+
+log @LOGDIR@/3proxy.log

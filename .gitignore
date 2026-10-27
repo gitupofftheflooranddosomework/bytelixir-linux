@@ -1,0 +1,5 @@
+# Rendered configs and live credentials must never be committed.
+credentials
+3proxy.cfg
+*.log
+test-output/
